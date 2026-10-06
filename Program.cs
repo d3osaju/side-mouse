@@ -1,0 +1,230 @@
+using Microsoft.Win32;
+using static SideMouse.Native;
+
+namespace SideMouse;
+
+static class Program
+{
+    [STAThread]
+    static void Main()
+    {
+        using var mutex = new Mutex(true, "SideMouse.SingleInstance", out bool firstInstance);
+        if (!firstInstance) return;
+
+        ApplicationConfiguration.Initialize();
+        Application.Run(new SideMouseApp());
+    }
+}
+
+/// <summary>
+/// Toggle with the hotkey. While active, the physical mouse is detached from the game:
+/// movement drives a fake cursor on the side monitor, and wheel/clicks are posted
+/// straight to the window under it, so nothing ever steals focus from the game.
+/// </summary>
+sealed class SideMouseApp : ApplicationContext
+{
+    readonly CursorOverlay _overlay = new();
+    readonly MouseHook _hook;
+    readonly NotifyIcon _tray;
+    readonly ToolStripMenuItem _toggleItem;
+    readonly ToolStripMenuItem _screenMenu;
+    readonly ToolStripMenuItem _shortcutMenu;
+
+    Shortcut _shortcut = Shortcut.Load();
+
+    Screen _target;
+    Point _pos;
+    bool _active;
+
+    public SideMouseApp()
+    {
+        _target = DefaultTarget();
+        _pos = Center(_target.Bounds);
+
+        _overlay.HotkeyPressed += Toggle;
+        _hook = new MouseHook { Handler = OnMouse };
+
+        _toggleItem = new ToolStripMenuItem("Control side screen", null, (_, _) => Toggle());
+        _screenMenu = new ToolStripMenuItem("Side screen");
+        _shortcutMenu = new ToolStripMenuItem("Shortcut");
+        foreach (var preset in Shortcut.Presets)
+            _shortcutMenu.DropDownItems.Add(preset.Name, null, (_, _) => ApplyShortcut(preset, save: true));
+        var menu = new ContextMenuStrip();
+        menu.Items.Add(_toggleItem);
+        menu.Items.Add(_screenMenu);
+        menu.Items.Add(_shortcutMenu);
+        menu.Items.Add(new ToolStripSeparator());
+        menu.Items.Add("Exit", null, (_, _) => ExitThread());
+        menu.Opening += (_, _) => RebuildScreenMenu();
+
+        _tray = new NotifyIcon
+        {
+            Icon = SystemIcons.Application,
+            ContextMenuStrip = menu,
+            Visible = true,
+        };
+        _tray.DoubleClick += (_, _) => Toggle();
+        ApplyShortcut(_shortcut, save: false);
+
+        SystemEvents.DisplaySettingsChanged += OnDisplaysChanged;
+    }
+
+    static Screen DefaultTarget() =>
+        Screen.AllScreens.FirstOrDefault(s => !s.Primary) ?? Screen.PrimaryScreen!;
+
+    static Point Center(Rectangle r) => new(r.Left + r.Width / 2, r.Top + r.Height / 2);
+
+    void ApplyShortcut(Shortcut shortcut, bool save)
+    {
+        if (shortcut.IsMouse)
+            _overlay.UnregisterHotkey();
+        else if (!_overlay.RegisterHotkey(shortcut.Mods, shortcut.Key))
+        {
+            MessageBox.Show($"Couldn't use {shortcut.Name} - another app already has it.", "SideMouse");
+            return;
+        }
+
+        _shortcut = shortcut;
+        if (save) shortcut.Save();
+        _tray.Text = $"SideMouse - {shortcut.Name} to toggle";
+        _toggleItem.Text = $"Control side screen ({shortcut.Name})";
+        foreach (ToolStripMenuItem item in _shortcutMenu.DropDownItems)
+            item.Checked = item.Text == shortcut.Name;
+    }
+
+    void Toggle()
+    {
+        _active = !_active;
+        _toggleItem.Checked = _active;
+
+        if (_active)
+        {
+            // Some fullscreen games confine the real cursor; we don't move it, but release
+            // the clip so it can't skew the deltas we read from the hook.
+            ClipCursor(IntPtr.Zero);
+            _overlay.MoveTipTo(_pos);
+            _overlay.Show();
+        }
+        else
+        {
+            _overlay.Hide();
+        }
+    }
+
+    bool OnMouse(int msg, MSLLHOOKSTRUCT data)
+    {
+        if ((data.flags & LLMHF_INJECTED) != 0) return false;
+
+        // Mouse-button shortcut: works whether or not we're active, and the game never sees it.
+        if (_shortcut.IsMouse && _shortcut.MatchesMouse(msg, data.mouseData, out bool down))
+        {
+            if (down) _overlay.BeginInvoke(Toggle); // keep the hook callback quick
+            return true;
+        }
+
+        if (!_active) return false;
+
+        switch (msg)
+        {
+            case WM_MOUSEMOVE:
+                // The event is swallowed, so the real cursor stays put and pt - cursor is the
+                // movement (already including the user's pointer speed/acceleration).
+                GetCursorPos(out var real);
+                MoveFake(data.pt.X - real.X, data.pt.Y - real.Y);
+                return true;
+
+            case WM_MOUSEWHEEL:
+            case WM_MOUSEHWHEEL:
+                PostWheel(msg, (short)(data.mouseData >> 16));
+                return true;
+
+            case WM_LBUTTONDOWN or WM_LBUTTONUP or WM_RBUTTONDOWN or WM_RBUTTONUP
+                or WM_MBUTTONDOWN or WM_MBUTTONUP:
+                PostButton(msg);
+                return true;
+
+            case WM_XBUTTONDOWN or WM_XBUTTONUP:
+                return true; // keep side buttons away from the game too
+
+            default:
+                return false;
+        }
+    }
+
+    void MoveFake(int dx, int dy)
+    {
+        if (dx == 0 && dy == 0) return;
+        var b = _target.Bounds;
+        _pos = new Point(Math.Clamp(_pos.X + dx, b.Left, b.Right - 1),
+                         Math.Clamp(_pos.Y + dy, b.Top, b.Bottom - 1));
+        _overlay.MoveTipTo(_pos);
+    }
+
+    IntPtr TargetWindow() =>
+        WindowFromPoint(new POINT { X = _pos.X, Y = _pos.Y });
+
+    void PostWheel(int msg, short delta)
+    {
+        var hwnd = TargetWindow();
+        if (hwnd == IntPtr.Zero) return;
+        // Wheel messages carry screen coordinates; DefWindowProc bubbles them up to a
+        // parent that scrolls if the child under the point doesn't.
+        PostMessage(hwnd, msg, (IntPtr)(delta << 16), MakeLParam(_pos.X, _pos.Y));
+    }
+
+    int _buttonsDown;
+
+    void PostButton(int msg)
+    {
+        var hwnd = TargetWindow();
+        if (hwnd == IntPtr.Zero) return;
+
+        _buttonsDown = msg switch
+        {
+            WM_LBUTTONDOWN => _buttonsDown | MK_LBUTTON,
+            WM_LBUTTONUP => _buttonsDown & ~MK_LBUTTON,
+            WM_RBUTTONDOWN => _buttonsDown | MK_RBUTTON,
+            WM_RBUTTONUP => _buttonsDown & ~MK_RBUTTON,
+            WM_MBUTTONDOWN => _buttonsDown | MK_MBUTTON,
+            WM_MBUTTONUP => _buttonsDown & ~MK_MBUTTON,
+            _ => _buttonsDown,
+        };
+
+        var client = new POINT { X = _pos.X, Y = _pos.Y };
+        ScreenToClient(hwnd, ref client);
+        var lParam = MakeLParam(client.X, client.Y);
+
+        // A move first, so apps that hit-test on hover know where the click lands.
+        PostMessage(hwnd, WM_MOUSEMOVE, (IntPtr)_buttonsDown, lParam);
+        PostMessage(hwnd, msg, (IntPtr)_buttonsDown, lParam);
+    }
+
+    void RebuildScreenMenu()
+    {
+        _screenMenu.DropDownItems.Clear();
+        foreach (var (screen, i) in Screen.AllScreens.Select((s, i) => (s, i)))
+        {
+            var label = $"Display {i + 1}: {screen.Bounds.Width}x{screen.Bounds.Height}{(screen.Primary ? " (primary)" : "")}";
+            var item = new ToolStripMenuItem(label) { Checked = screen.DeviceName == _target.DeviceName };
+            item.Click += (_, _) => { _target = screen; _pos = Center(screen.Bounds); if (_active) _overlay.MoveTipTo(_pos); };
+            _screenMenu.DropDownItems.Add(item);
+        }
+    }
+
+    void OnDisplaysChanged(object? sender, EventArgs e)
+    {
+        _target = Screen.AllScreens.FirstOrDefault(s => s.DeviceName == _target.DeviceName) ?? DefaultTarget();
+        _pos = Center(_target.Bounds);
+        if (_active) _overlay.MoveTipTo(_pos);
+    }
+
+    protected override void ExitThreadCore()
+    {
+        SystemEvents.DisplaySettingsChanged -= OnDisplaysChanged;
+        _hook.Dispose();
+        _tray.Visible = false;
+        _tray.Dispose();
+        _overlay.Dispose();
+        base.ExitThreadCore();
+    }
+}
