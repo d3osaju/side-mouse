@@ -2,7 +2,7 @@
 
 Use your mouse on a second monitor while a fullscreen game stays focused on the main one, without minimising it.
 
-Click the **middle mouse button** to switch the mouse to the side screen, and click it again to give it back to the game. While it's on the side screen:
+Click the **middle mouse button** to switch the mouse to the side screen. Click it again, or press **Esc**, to give it back to the game. That Esc is not passed to the game, so it won't open the pause menu. While it's on the side screen:
 
 - A fake cursor moves around the second monitor.
 - Scrolling and left/right clicks go to the window under that cursor.

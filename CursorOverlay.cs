@@ -10,13 +10,14 @@ namespace SideMouse;
 /// </summary>
 sealed class CursorOverlay : Form
 {
-    const int HotkeyId = 1;
+    const int HotkeyId = 1, EscapeId = 2;
     static readonly Point[] Arrow =
     [
         new(0, 0), new(0, 17), new(4, 13), new(7, 20), new(10, 19), new(7, 12), new(12, 12),
     ];
 
     public event Action? HotkeyPressed;
+    public event Action? EscapePressed;
 
     public CursorOverlay()
     {
@@ -50,6 +51,11 @@ sealed class CursorOverlay : Form
 
     public void UnregisterHotkey() => UnregisterHotKey(Handle, HotkeyId);
 
+    // Only grabbed while the side screen is in use - a registered hotkey eats the key
+    // system-wide, and the game needs Esc the rest of the time.
+    public void GrabEscape() => Native.RegisterHotKey(Handle, EscapeId, MOD_NOREPEAT, (uint)Keys.Escape);
+    public void ReleaseEscape() => UnregisterHotKey(Handle, EscapeId);
+
     /// <summary>Places the arrow tip at a screen point without activating or re-ordering focus.</summary>
     public void MoveTipTo(Point p) =>
         SetWindowPos(Handle, HWND_TOPMOST, p.X, p.Y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE);
@@ -68,12 +74,17 @@ sealed class CursorOverlay : Form
     protected override void WndProc(ref Message m)
     {
         if (m.Msg == WM_HOTKEY && (int)m.WParam == HotkeyId) HotkeyPressed?.Invoke();
+        if (m.Msg == WM_HOTKEY && (int)m.WParam == EscapeId) EscapePressed?.Invoke();
         base.WndProc(ref m);
     }
 
     protected override void Dispose(bool disposing)
     {
-        if (IsHandleCreated) UnregisterHotKey(Handle, HotkeyId);
+        if (IsHandleCreated)
+        {
+            UnregisterHotKey(Handle, HotkeyId);
+            ReleaseEscape();
+        }
         base.Dispose(disposing);
     }
 }

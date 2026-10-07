@@ -7,9 +7,9 @@ static class Native
     public const int WH_MOUSE_LL = 14;
     public const int WM_HOTKEY = 0x0312;
     public const int WM_MOUSEMOVE = 0x0200;
-    public const int WM_LBUTTONDOWN = 0x0201, WM_LBUTTONUP = 0x0202;
-    public const int WM_RBUTTONDOWN = 0x0204, WM_RBUTTONUP = 0x0205;
-    public const int WM_MBUTTONDOWN = 0x0207, WM_MBUTTONUP = 0x0208;
+    public const int WM_LBUTTONDOWN = 0x0201, WM_LBUTTONUP = 0x0202, WM_LBUTTONDBLCLK = 0x0203;
+    public const int WM_RBUTTONDOWN = 0x0204, WM_RBUTTONUP = 0x0205, WM_RBUTTONDBLCLK = 0x0206;
+    public const int WM_MBUTTONDOWN = 0x0207, WM_MBUTTONUP = 0x0208, WM_MBUTTONDBLCLK = 0x0209;
     public const int WM_MOUSEWHEEL = 0x020A, WM_MOUSEHWHEEL = 0x020E;
     public const int WM_XBUTTONDOWN = 0x020B, WM_XBUTTONUP = 0x020C;
 
@@ -21,11 +21,17 @@ static class Native
     public const int WS_EX_TOPMOST = 0x8, WS_EX_TRANSPARENT = 0x20, WS_EX_TOOLWINDOW = 0x80,
                      WS_EX_LAYERED = 0x80000, WS_EX_NOACTIVATE = 0x8000000;
 
+    public const int GCL_STYLE = -26, CS_DBLCLKS = 0x8;
+    public const int SM_CXDOUBLECLK = 36, SM_CYDOUBLECLK = 37;
+
     public static readonly IntPtr HWND_TOPMOST = new(-1);
     public const uint SWP_NOSIZE = 0x1, SWP_NOACTIVATE = 0x10;
 
     [StructLayout(LayoutKind.Sequential)]
     public struct POINT { public int X, Y; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct RECT { public int Left, Top, Right, Bottom; }
 
     [StructLayout(LayoutKind.Sequential)]
     public struct MSLLHOOKSTRUCT
@@ -46,7 +52,13 @@ static class Native
     [DllImport("kernel32.dll")] public static extern IntPtr GetModuleHandle(string? name);
 
     [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT p);
+    [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
     [DllImport("user32.dll")] public static extern bool ClipCursor(IntPtr rect);
+    [DllImport("user32.dll")] public static extern bool ClipCursor(ref RECT rect);
+    [DllImport("user32.dll")] public static extern bool GetClipCursor(out RECT rect);
+    [DllImport("user32.dll")] public static extern uint GetDoubleClickTime();
+    [DllImport("user32.dll")] public static extern int GetSystemMetrics(int index);
+    [DllImport("user32.dll")] public static extern IntPtr GetClassLongPtr(IntPtr hwnd, int index);
     [DllImport("user32.dll")] public static extern IntPtr WindowFromPoint(POINT p);
     [DllImport("user32.dll")] public static extern bool ScreenToClient(IntPtr hwnd, ref POINT p);
     [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam);

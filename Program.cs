@@ -42,7 +42,9 @@ sealed class SideMouseApp : ApplicationContext
         _pos = Center(_target.Bounds);
 
         _overlay.HotkeyPressed += Toggle;
+        _overlay.EscapePressed += () => { if (_active) Toggle(); };
         _hook = new MouseHook { Handler = OnMouse };
+        _restoreTimer.Tick += (_, _) => RestoreRealCursor();
 
         _toggleItem = new ToolStripMenuItem("Control side screen", null, (_, _) => Toggle());
         _screenMenu = new ToolStripMenuItem("Side screen");
@@ -99,15 +101,26 @@ sealed class SideMouseApp : ApplicationContext
 
         if (_active)
         {
-            // Some fullscreen games confine the real cursor; we don't move it, but release
-            // the clip so it can't skew the deltas we read from the hook.
+            // Remember exactly how the game left the cursor (where it is and the rectangle
+            // the game confines it to) so we can hand it back untouched. Then release the
+            // confinement so it can't skew the deltas we read from the hook.
+            GetCursorPos(out _gameCursor);
+            GetClipCursor(out _gameClip);
             ClipCursor(IntPtr.Zero);
             _overlay.MoveTipTo(_pos);
             _overlay.Show();
+            _overlay.GrabEscape();
         }
         else
         {
+            _overlay.ReleaseEscape();
             _overlay.Hide();
+            _buttonsDown = 0;
+            _pressHwnd = IntPtr.Zero;
+            RestoreRealCursor();
+            // Re-lock the cursor to the game; otherwise it stays free to wander onto the side
+            // screen until the game re-confines it (e.g. after a trip through its menu).
+            ClipCursor(ref _gameClip);
         }
     }
 
@@ -130,7 +143,10 @@ sealed class SideMouseApp : ApplicationContext
                 // The event is swallowed, so the real cursor stays put and pt - cursor is the
                 // movement (already including the user's pointer speed/acceleration).
                 GetCursorPos(out var real);
-                MoveFake(data.pt.X - real.X, data.pt.Y - real.Y);
+                int dx = data.pt.X - real.X, dy = data.pt.Y - real.Y;
+                // A huge jump means the real cursor was repositioned (by us or the game)
+                // between the event and now - not something a hand can do in one report.
+                if (Math.Abs(dx) < 400 && Math.Abs(dy) < 400) MoveFake(dx, dy);
                 return true;
 
             case WM_MOUSEWHEEL:
@@ -158,10 +174,25 @@ sealed class SideMouseApp : ApplicationContext
         _pos = new Point(Math.Clamp(_pos.X + dx, b.Left, b.Right - 1),
                          Math.Clamp(_pos.Y + dy, b.Top, b.Bottom - 1));
         _overlay.MoveTipTo(_pos);
+
+        // Mid-press: keep the real cursor under the fake one and feed the captured window
+        // button-held moves, so drag-select and drag-and-drop follow the fake cursor.
+        if (_pressHwnd != IntPtr.Zero)
+        {
+            ParkRealCursor();
+            PostMessage(_pressHwnd, WM_MOUSEMOVE, (IntPtr)_buttonsDown, ClientLParam(_pressHwnd));
+        }
     }
 
     IntPtr TargetWindow() =>
         WindowFromPoint(new POINT { X = _pos.X, Y = _pos.Y });
+
+    IntPtr ClientLParam(IntPtr hwnd)
+    {
+        var client = new POINT { X = _pos.X, Y = _pos.Y };
+        ScreenToClient(hwnd, ref client);
+        return MakeLParam(client.X, client.Y);
+    }
 
     void PostWheel(int msg, short delta)
     {
@@ -173,10 +204,35 @@ sealed class SideMouseApp : ApplicationContext
     }
 
     int _buttonsDown;
+    IntPtr _pressHwnd;        // window that got the first button-down, like mouse capture
+    POINT _gameCursor;        // where the game had the real cursor when we took over
+    RECT _gameClip;           // the game's cursor confinement at that moment
+    readonly System.Windows.Forms.Timer _restoreTimer = new() { Interval = 80 };
+
+    // Windows only synthesises double-clicks from real input, so detect them ourselves.
+    int _lastDownMsg;
+    long _lastDownTick;
+    Point _lastDownPos;
+
+    void ParkRealCursor()
+    {
+        // Apps cross-check GetCursorPos / DragDetect against the click; if the real cursor
+        // is back on the game screen they think the mouse already moved and start a drag.
+        // Moving the cursor never changes focus, so the game stays in front.
+        ClipCursor(IntPtr.Zero);
+        SetCursorPos(_pos.X, _pos.Y);
+    }
 
     void PostButton(int msg)
     {
-        var hwnd = TargetWindow();
+        bool isDown = msg is WM_LBUTTONDOWN or WM_RBUTTONDOWN or WM_MBUTTONDOWN;
+
+        if (isDown && _buttonsDown == 0)
+        {
+            _restoreTimer.Stop();
+            _pressHwnd = TargetWindow();
+        }
+        var hwnd = _pressHwnd != IntPtr.Zero ? _pressHwnd : TargetWindow();
         if (hwnd == IntPtr.Zero) return;
 
         _buttonsDown = msg switch
@@ -190,13 +246,50 @@ sealed class SideMouseApp : ApplicationContext
             _ => _buttonsDown,
         };
 
-        var client = new POINT { X = _pos.X, Y = _pos.Y };
-        ScreenToClient(hwnd, ref client);
-        var lParam = MakeLParam(client.X, client.Y);
+        ParkRealCursor();
+        var lParam = ClientLParam(hwnd);
+        int post = isDown ? DoubleClickOrDown(msg, hwnd) : msg;
 
         // A move first, so apps that hit-test on hover know where the click lands.
         PostMessage(hwnd, WM_MOUSEMOVE, (IntPtr)_buttonsDown, lParam);
-        PostMessage(hwnd, msg, (IntPtr)_buttonsDown, lParam);
+        PostMessage(hwnd, post, (IntPtr)_buttonsDown, lParam);
+
+        if (_buttonsDown == 0)
+        {
+            _pressHwnd = IntPtr.Zero;
+            // Give the app a moment to process the button-up before the cursor jumps away.
+            _restoreTimer.Start();
+        }
+    }
+
+    void RestoreRealCursor()
+    {
+        _restoreTimer.Stop();
+        if (_buttonsDown != 0) return;
+        SetCursorPos(_gameCursor.X, _gameCursor.Y);
+    }
+
+    int DoubleClickOrDown(int msg, IntPtr hwnd)
+    {
+        long now = Environment.TickCount64;
+        bool isDouble = msg == _lastDownMsg
+            && now - _lastDownTick <= GetDoubleClickTime()
+            && Math.Abs(_pos.X - _lastDownPos.X) <= GetSystemMetrics(SM_CXDOUBLECLK) / 2
+            && Math.Abs(_pos.Y - _lastDownPos.Y) <= GetSystemMetrics(SM_CYDOUBLECLK) / 2
+            && (GetClassLongPtr(hwnd, GCL_STYLE).ToInt64() & CS_DBLCLKS) != 0;
+
+        // A third click starts a fresh pair, like real input.
+        _lastDownMsg = isDouble ? 0 : msg;
+        _lastDownTick = now;
+        _lastDownPos = _pos;
+
+        if (!isDouble) return msg;
+        return msg switch
+        {
+            WM_LBUTTONDOWN => WM_LBUTTONDBLCLK,
+            WM_RBUTTONDOWN => WM_RBUTTONDBLCLK,
+            _ => WM_MBUTTONDBLCLK,
+        };
     }
 
     void RebuildScreenMenu()
@@ -222,6 +315,7 @@ sealed class SideMouseApp : ApplicationContext
     {
         SystemEvents.DisplaySettingsChanged -= OnDisplaysChanged;
         _hook.Dispose();
+        _restoreTimer.Dispose();
         _tray.Visible = false;
         _tray.Dispose();
         _overlay.Dispose();
